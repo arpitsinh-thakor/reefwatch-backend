@@ -9,3 +9,5 @@ albumentations>=1.4
 
 pillow>=10.0
 reportlab>=4.0
+
+huggingface_hub

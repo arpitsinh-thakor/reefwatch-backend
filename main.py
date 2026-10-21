@@ -28,6 +28,12 @@ from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, Tabl
 from inference import CLASSES, MODEL_NAMES, CoralPredictor
 from segmentation import SegmentationPredictor
 
+from download_checkpoints import ensure_checkpoints
+
+CHECKPOINT_PATHS = ensure_checkpoints()
+
+# Load your existing models after this point.
+
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 IMAGE_DIR = DATA_DIR / "images"
