@@ -1,10 +1,13 @@
 
-"""Notebook-faithful CoralScope inference:
+"""Notebook-faithful CoralScope inference with sequential model loading.
+
 EfficientNetV2-S + ConvNeXt-Tiny, fold 0, 3-view TTA.
+Only one classification model is kept in memory at a time.
 """
 from pathlib import Path
 from io import BytesIO
 import base64
+import gc
 
 import albumentations as A
 import cv2
@@ -17,10 +20,9 @@ from PIL import Image
 from model import build_model
 
 
-# Limit CPU thread usage on resource-constrained hosting.
+# Reduce CPU thread overhead on resource-constrained hosting.
 torch.set_num_threads(1)
 
-# Exact class order from notebook cell 15.
 CLASSES = ["bleached", "dead", "healthy"]
 
 MODEL_NAMES = [
@@ -35,8 +37,7 @@ STD = (0.229, 0.224, 0.225)
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-# Match notebook val_tf and tta_tf_list:
-# identity, horizontal flip, and RandomRotate90.
+# Notebook validation transform and three-view TTA.
 VAL_TRANSFORM = A.Compose([
     A.Resize(IMAGE_SIZE, IMAGE_SIZE),
     A.Normalize(mean=MEAN, std=STD),
@@ -61,7 +62,7 @@ TTA_TRANSFORMS = [
 
 
 def underwater_color_correct(img_bgr: np.ndarray) -> np.ndarray:
-    """Apply notebook CLAHE on the LAB L channel."""
+    """Apply notebook CLAHE to the L channel in LAB color space."""
     lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB)
     l, a, b = cv2.split(lab)
 
@@ -76,19 +77,15 @@ def underwater_color_correct(img_bgr: np.ndarray) -> np.ndarray:
 
 def _b64_jpeg(rgb: np.ndarray, quality: int = 90) -> str:
     buff = BytesIO()
-    Image.fromarray(rgb).save(
-        buff,
-        format="JPEG",
-        quality=quality,
-    )
+    Image.fromarray(rgb).save(buff, format="JPEG", quality=quality)
     return base64.b64encode(buff.getvalue()).decode("ascii")
 
 
 class CoralPredictor:
-    """Two-backbone softmax ensemble averaged over three TTA views.
+    """Sequential two-backbone softmax ensemble with three-view TTA.
 
-    The deployed default is fold 0, matching the notebook demo.
-    Grad-CAM is computed using the primary EfficientNetV2-S model.
+    Models are loaded for an operation and released afterward.
+    Grad-CAM is computed with EfficientNetV2-S when requested.
     """
 
     def __init__(self, checkpoint_dir: str | Path, fold: int = 0):
@@ -96,63 +93,59 @@ class CoralPredictor:
         self.fold = int(fold)
         self.models = {}
 
-        # Check that both checkpoints exist before loading either model.
-        missing = []
-
-        for name in MODEL_NAMES:
-            filename = f"{name.replace('/', '_')}_fold{self.fold}.pt"
-            path = self.checkpoint_dir / filename
-
-            if not path.is_file():
-                missing.append(str(path))
+        # Validate both files without loading either model into RAM.
+        missing = [
+            str(self._checkpoint_path(name))
+            for name in MODEL_NAMES
+            if not self._checkpoint_path(name).is_file()
+        ]
 
         if missing:
             raise FileNotFoundError(
-                "The notebook-faithful ensemble requires both fold "
-                "checkpoints. Missing: " + ", ".join(missing)
+                "The ensemble requires both fold checkpoints. Missing: "
+                + ", ".join(missing)
             )
-
-        # Load the models one at a time.
-        for name in MODEL_NAMES:
-            path = self.checkpoint_dir / (
-                f"{name.replace('/', '_')}_fold{self.fold}.pt"
-            )
-
-            model = build_model(
-                name,
-                num_classes=len(CLASSES),
-                dropout=0.3,
-            )
-
-            # Load checkpoint tensors on CPU to avoid placing the
-            # temporary state dictionary directly on the GPU.
-            try:
-                state = torch.load(
-                    path,
-                    map_location="cpu",
-                    weights_only=True,
-                )
-            except TypeError:
-                # Compatibility fallback for older PyTorch versions.
-                state = torch.load(
-                    path,
-                    map_location="cpu",
-                )
-
-            model.load_state_dict(state)
-
-            # Release the temporary checkpoint state dictionary.
-            del state
-
-            model.to(DEVICE)
-            model.eval()
-
-            self.models[name] = model
 
         self.checkpoint = ";".join(
-            f"{name.replace('/', '_')}_fold{self.fold}.pt"
-            for name in MODEL_NAMES
+            self._checkpoint_path(name).name for name in MODEL_NAMES
         )
+
+    def _checkpoint_path(self, name: str) -> Path:
+        filename = f"{name.replace('/', '_')}_fold{self.fold}.pt"
+        return self.checkpoint_dir / filename
+
+    def _load_model(self, name: str):
+        """Load a single checkpoint, preferring memory-efficient assignment."""
+        path = self._checkpoint_path(name)
+
+        model = build_model(
+            name,
+            num_classes=len(CLASSES),
+            dropout=0.3,
+        )
+
+        try:
+            state = torch.load(
+                path,
+                map_location="cpu",
+                weights_only=True,
+            )
+        except TypeError:
+            state = torch.load(path, map_location="cpu")
+
+        try:
+            # assign=True can avoid copying checkpoint tensors into a second
+            # set of initialized parameter tensors on supported PyTorch.
+            try:
+                model.load_state_dict(state, assign=True)
+            except TypeError:
+                model.load_state_dict(state)
+        finally:
+            del state
+
+        model.to(DEVICE)
+        model.eval()
+        return model
 
     def _prepare(self, image_bgr: np.ndarray):
         corrected_bgr = underwater_color_correct(image_bgr)
@@ -162,18 +155,19 @@ class CoralPredictor:
         )
         return corrected_bgr, corrected_rgb
 
-    def _predict_probs(self, corrected_rgb: np.ndarray) -> np.ndarray:
-        probs_sum = torch.zeros(
-            len(CLASSES),
-            device=DEVICE,
-        )
-        n = 0
+    def _predict_one_model(
+        self,
+        model_name: str,
+        corrected_rgb: np.ndarray,
+    ) -> np.ndarray:
+        """Average the three TTA softmax vectors for one model."""
+        model = None
 
-        # Inference mode reduces autograd bookkeeping for classification.
-        with torch.inference_mode():
-            for model_name in MODEL_NAMES:
-                model = self.models[model_name]
+        try:
+            model = self._load_model(model_name)
+            probs_sum = torch.zeros(len(CLASSES), device=DEVICE)
 
+            with torch.inference_mode():
                 for transform in TTA_TRANSFORMS:
                     x = transform(
                         image=corrected_rgb
@@ -185,19 +179,38 @@ class CoralPredictor:
                     ):
                         logits = model(x)
 
-                    probs_sum += F.softmax(
-                        logits.float(),
-                        dim=1,
-                    )[0]
+                    probs_sum += F.softmax(logits.float(), dim=1)[0]
 
-                    n += 1
+            return (probs_sum / len(TTA_TRANSFORMS)).cpu().numpy()
 
-        return (probs_sum / n).cpu().numpy()
+        finally:
+            if model is not None:
+                del model
+
+            gc.collect()
+
+            if DEVICE.type == "cuda":
+                torch.cuda.empty_cache()
+
+    def _predict_probs(self, corrected_rgb: np.ndarray) -> np.ndarray:
+        """Average both models' three-view probability vectors."""
+        ensemble_sum = np.zeros(len(CLASSES), dtype=np.float64)
+
+        for model_name in MODEL_NAMES:
+            model_probs = self._predict_one_model(
+                model_name,
+                corrected_rgb,
+            )
+            ensemble_sum += model_probs
+
+            del model_probs
+            gc.collect()
+
+        return (ensemble_sum / len(MODEL_NAMES)).astype(np.float32)
 
     @staticmethod
     def _uncertainty(probs: np.ndarray) -> dict:
         sorted_p = np.sort(probs)[::-1]
-
         margin = float(sorted_p[0] - sorted_p[1])
         entropy = float(
             -(probs * np.log(probs + 1e-12)).sum()
@@ -205,8 +218,6 @@ class CoralPredictor:
         )
         confidence = float(sorted_p[0])
 
-        # Operational review flag; scores are not calibrated ecological
-        # probabilities.
         needs_review = (
             confidence < 0.70
             or margin < 0.15
@@ -214,13 +225,10 @@ class CoralPredictor:
         )
 
         reasons = []
-
         if confidence < 0.70:
             reasons.append("top-class score below 0.70")
-
         if margin < 0.15:
             reasons.append("top-two class margin below 0.15")
-
         if entropy > 0.75:
             reasons.append("normalized entropy above 0.75")
 
@@ -239,11 +247,9 @@ class CoralPredictor:
         explain: bool = True,
     ) -> dict:
         if image_bgr is None or image_bgr.size == 0:
-            raise ValueError(
-                "The uploaded file is not a valid image."
-            )
+            raise ValueError("The uploaded file is not a valid image.")
 
-        corrected_bgr, corrected_rgb = self._prepare(image_bgr)
+        _, corrected_rgb = self._prepare(image_bgr)
         probs = self._predict_probs(corrected_rgb)
 
         idx = int(np.argmax(probs))
@@ -272,7 +278,6 @@ class CoralPredictor:
             "tta_views": 3,
         }
 
-        # Optional visual assets and Grad-CAM explanation.
         if explain:
             result["corrected_image"] = (
                 f"data:image/jpeg;base64,{_b64_jpeg(corrected_rgb)}"
@@ -286,35 +291,36 @@ class CoralPredictor:
         corrected_rgb: np.ndarray,
         class_idx: int,
     ) -> dict:
-        model = self.models[MODEL_NAMES[0]]
-
-        target_layer = (
-            model.backbone.blocks[-1]
-            if hasattr(model.backbone, "blocks")
-            else model.backbone.stages[-1]
-        )
-
+        """Load only EfficientNetV2-S to compute the Grad-CAM heatmap."""
+        model = None
+        handle = None
         activations = {}
         gradients = {}
 
-        def forward_hook(_module, _inputs, output):
-            activations["value"] = output
-
-            if output.requires_grad:
-                output.register_hook(
-                    lambda grad: gradients.__setitem__("value", grad)
-                )
-
-        handle = target_layer.register_forward_hook(forward_hook)
-
         try:
+            model = self._load_model(MODEL_NAMES[0])
+
+            target_layer = (
+                model.backbone.blocks[-1]
+                if hasattr(model.backbone, "blocks")
+                else model.backbone.stages[-1]
+            )
+
+            def forward_hook(_module, _inputs, output):
+                activations["value"] = output
+                if output.requires_grad:
+                    output.register_hook(
+                        lambda grad: gradients.__setitem__("value", grad)
+                    )
+
+            handle = target_layer.register_forward_hook(forward_hook)
+
             x = VAL_TRANSFORM(
                 image=corrected_rgb
             )["image"].unsqueeze(0).to(DEVICE)
 
             model.zero_grad(set_to_none=True)
 
-            # Grad-CAM requires gradients, so do not use inference_mode here.
             with torch.enable_grad():
                 with torch.autocast(
                     device_type=DEVICE.type,
@@ -327,11 +333,7 @@ class CoralPredictor:
             feat = activations["value"].detach()
             grad = gradients["value"].detach()
 
-            weights = grad.mean(
-                dim=(2, 3),
-                keepdim=True,
-            )
-
+            weights = grad.mean(dim=(2, 3), keepdim=True)
             cam = torch.relu(
                 (weights * feat).sum(dim=1, keepdim=True)
             )
@@ -346,19 +348,9 @@ class CoralPredictor:
             cam = cam - cam.min()
             cam = cam / (cam.max() + 1e-8)
 
-            gray = (
-                cam.cpu().numpy() * 255
-            ).astype(np.uint8)
-
-            heat_bgr = cv2.applyColorMap(
-                gray,
-                cv2.COLORMAP_JET,
-            )
-
-            heat_rgb = cv2.cvtColor(
-                heat_bgr,
-                cv2.COLOR_BGR2RGB,
-            )
+            gray = (cam.cpu().numpy() * 255).astype(np.uint8)
+            heat_bgr = cv2.applyColorMap(gray, cv2.COLORMAP_JET)
+            heat_rgb = cv2.cvtColor(heat_bgr, cv2.COLOR_BGR2RGB)
 
             return {
                 "gradcam_heatmap": (
@@ -366,12 +358,21 @@ class CoralPredictor:
                 ),
                 "explanation": (
                     "Grad-CAM is computed on the primary "
-                    "EfficientNetV2-S fold-0 model for the class "
-                    "selected by the ensemble. It is a qualitative "
-                    "diagnostic, not segmentation or causal proof."
+                    "EfficientNetV2-S model for the class selected by "
+                    "the ensemble. It is a qualitative diagnostic, "
+                    "not segmentation or causal proof."
                 ),
             }
 
         finally:
-            handle.remove()
-            model.zero_grad(set_to_none=True)
+            if handle is not None:
+                handle.remove()
+
+            if model is not None:
+                model.zero_grad(set_to_none=True)
+                del model
+
+            gc.collect()
+
+            if DEVICE.type == "cuda":
+                torch.cuda.empty_cache()
