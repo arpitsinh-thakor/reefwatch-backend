@@ -40,6 +40,12 @@ IMAGE_DIR.mkdir(parents=True, exist_ok=True)
 
 from fastapi.middleware.cors import CORSMiddleware
 
+
+app = FastAPI(
+    title="Reefwatch Coral Research API",
+    description="Notebook-faithful coral classification, Grad-CAM, review queue, research evaluation, exports, and reef observations.",
+    version="2.0.0",
+)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -51,11 +57,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app = FastAPI(
-    title="Reefwatch Coral Research API",
-    description="Notebook-faithful coral classification, Grad-CAM, review queue, research evaluation, exports, and reef observations.",
-    version="2.0.0",
-)
 origins = [x.strip() for x in os.getenv("CORAL_FRONTEND_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000").split(",") if x.strip()]
 app.add_middleware(CORSMiddleware, allow_origins=origins, allow_credentials=False, allow_methods=["GET", "POST", "PATCH"], allow_headers=["*"])
 
