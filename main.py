@@ -38,6 +38,19 @@ MAX_CSV_BYTES = 20 * 1024 * 1024
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 IMAGE_DIR.mkdir(parents=True, exist_ok=True)
 
+from fastapi.middleware.cors import CORSMiddleware
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "https://reefwatch-frontend.vercel.app",
+        "http://localhost:3000",  # local development
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 app = FastAPI(
     title="Reefwatch Coral Research API",
     description="Notebook-faithful coral classification, Grad-CAM, review queue, research evaluation, exports, and reef observations.",
