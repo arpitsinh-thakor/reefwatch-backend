@@ -1,0 +1,1 @@
+Copy tf_efficientnetv2_s.in21k_ft_in1k_fold0.pt into this folder. The model weights are not bundled.
